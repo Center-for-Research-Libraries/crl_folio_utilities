@@ -7,10 +7,12 @@ import requests
 import pymarc
 import sys
 import json
+from processer import processer
 import threading
 import time
+import sqlite3
+import text_marc_reader
 
-okapi_url = None
 
 #Creates the folder if it does not already exist
 def check_or_create_dir(path):
@@ -18,7 +20,6 @@ def check_or_create_dir(path):
         if not os.path.exists(os.path.dirname(path)):
             check_or_create_dir(os.path.dirname(path))
         os.mkdir(path)
-
 
 class configuration:
     def __init__(self):
@@ -35,8 +36,6 @@ class configuration:
         self.config_file = os.path.join(self.config_folder, 'okapi_manager.ini')
         self.config_data = {}
         self.read_config_file()
-
-    #
     def read_config_file(self):
         check_or_create_dir(self.config_folder)
         # create a blank file if none exists
@@ -77,29 +76,38 @@ def get_password_from_user():
     password = input('Password:  ')
     return password
 
+def save_password():
+    save = input('Save password (yes/no)?  ')
+    save_boolean = False
+    if re.match('(ye?s?)', save.lower()):
+        save_boolean = True
+    return save_boolean
+
 def get_uuid_from_user():
     uuid = input('UUID:  ')
     return uuid
 
-
+#Gets auth information
 def auth(change_okapi_url=False, change_tenant=False, change_username=False, change_password=False, refresh_token=False):
-    global okapi_url
-    okapi_url='https://okapi-crl.folio.ebsco.com'
-    url = okapi_url + '/authn/login'
     if change_okapi_url or change_tenant or change_tenant or change_username or change_password or refresh_token or'tenant' not in config.config['data'] or 'username' not in config.config['data'] or 'password' not in config.config['data'] or 'okapi_token' not in config.config['data']:
         if change_okapi_url or 'okapi_url' not in config.config['data']:
             config.config['data']['okapi_url'] = get_okapi_url_from_user()
+        url = config.config['data']['okapi_url'] + '/authn/login'
         if change_tenant or 'tenant' not in config.config['data']:
             config.config['data']['tenant'] = get_tenant_from_user()
         if change_username or 'username' not in config.config['data']:
             config.config['data']['username'] = get_username_from_user()
+        save_pass = False
         if change_password or 'password' not in config.config['data']:
             config.config['data']['password'] = get_password_from_user()
+            save_pass = save_password()
         data = '{\"tenant\" : \"' + config.config['data']['tenant'] + '\", \"username\" : \"' + config.config['data']['username'] + '\", \"password\" : \"' + config.config['data']['password'] + '\"}'
         headers = {'Content-type' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant']}
         if refresh_token or 'okapi_token' not in config.config['data']:
             req = requests.post(url, data=data, headers=headers)
             config.config['data']['okapi_token'] = req.json()['okapiToken']
+        if not save_pass:
+            config.config['data']['password'] = None
         config.write_config_file()
 
 #Checks auth on start up.
@@ -128,7 +136,6 @@ def print_status(current, last):
     sys.stdout.write('\r{0} complete.  Record {1} of {2}'.format(i, current, last))
     sys.stdout.flush()
 
-#Formats 006 field dictionary into string
 def format_006(data):
     formatted_006 = ''
     #Books
@@ -160,12 +167,12 @@ def format_006(data):
     return formatted_006
 
 
-#Formats 007 field dictionary into string
 def format_007(data):
     formatted_007 = ''
     #Electronic Resource
     if data['$categoryName'].lower() == 'electronic resource':
         formatted_007 = list_to_string(data['Category']) + list_to_string(data['SMD']) + ' ' + list_to_string(data['Color']) + list_to_string(data['Dimensions']) + list_to_string(data['Sound']) + list_to_string(data['Image bit depth']) + list_to_string(data['File formats']) + list_to_string(data['Quality assurance target(s)']) + list_to_string(data['Antecedent/ Source']) + list_to_string(data['Level of compression']) + list_to_string(data['Reformatting quality'])
+#        formatted_007 = list_to_string(data['Category']) + list_to_string(data['SMD']) + ' ' + list_to_string(data['Color']) + list_to_string(data['Dimensions']) + list_to_string(data['Sound'])
     #Globe
     elif data['$categoryName'].lower() == 'globe':
         formatted_007 = list_to_string(data['Category']) + list_to_string(data['SMD']) + ' ' + list_to_string(data['Color']) + list_to_string(data['Physical medium']) + list_to_string(data['Type of reproduction'])
@@ -219,7 +226,6 @@ def format_007(data):
     formatted_007 = replace_slash(formatted_007)
     return formatted_007
 
-#Formats 008 field dictionary into string
 def format_008(data):
     formatted_008 = ''
     field_008_start = list_to_string(data['Entered']) + list_to_string(data['DtSt']) + list_to_string(data['Date1']) + list_to_string(data['Date2']) + list_to_string(data['Ctry'])
@@ -251,13 +257,31 @@ def format_008(data):
     formatted_008 = replace_slash(field_008_start + field_008_middle + field_008_end)
     return formatted_008
 
-#Converts record from json to marc then returns record.
-def get_marc(uuid = None):
-    global okapi_url
+#Set up database, and returns connection and cursor.
+def setup_database(initialize = False):
+    conn = sqlite3.connect('folio_action.db')
+    if initialize:
+        cur = conn.cursor()
+        try:
+            cur.execute('CREATE TABLE IF NOT EXISTS folio_action (action_id, record)')
+            cur.execute('CREATE INDEX folio_index ON folio_action(action_id)')
+        except sqlite3.OperationalError:
+            cur.execute('DROP INDEX folio_index')
+            cur.execute('DROP TABLE folio_action')
+            cur.execute('CREATE TABLE IF NOT EXISTS folio_action (action_id, record)')
+            cur.execute('CREATE INDEX folio_index ON folio_action(action_id)')
+    else:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+    return [conn, cur]
+
+#Converts record from json to marc then returns record (for multithreading).
+def get_marc_thread(action_id, uuid = None, attempt = 1):
+    conn, cur = setup_database()
     if uuid is None:
         uuid = get_uuid_from_user()
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
-    url = okapi_url + '/records-editor/records?externalId=' + uuid
+    url = config.config['data']['okapi_url'] + '/records-editor/records?externalId=' + uuid
     req = requests.get(url, headers=headers)
     json_record = req.json()
     record = pymarc.Record()
@@ -280,15 +304,49 @@ def get_marc(uuid = None):
                 subfields.append(match.group(1))
                 subfields.append(match.group(2))
             record.add_field(pymarc.Field(row['tag'], row['indicators'], subfields))
-    print()
-    print(record)
+    insert_into_table = (str(action_id), str(record))
+    try:
+        cur.execute('INSERT INTO folio_action VALUES (?,?)', insert_into_table)
+        conn.commit()
+    except sqlite3.OperationalError:
+        if attempt >= 10:
+            time.sleep(2 * attempt)
+            get_marc_thread(action_id, uuid, attempt = attempt + 1)
+
+#Converts record from json to marc then returns record.
+def get_marc(uuid = None):
+    if uuid is None:
+        uuid = get_uuid_from_user()
+    headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
+    url = config.config['data']['okapi_url'] + '/records-editor/records?externalId=' + uuid
+    req = requests.get(url, headers=headers)
+    json_record = req.json()
+    record = pymarc.Record()
+    record.leader = replace_slash(json_record['leader'])
+    row_006 = None
+    for row in json_record['fields']:
+        tag = row['tag']
+        if int(row['tag']) < 10:
+            if int(row['tag']) in [6, 7, 8]:
+                if int(row['tag']) == 6:
+                    row['content'] = format_006(row['content'])
+                if int(row['tag']) == 7:
+                    row['content'] = format_007(row['content'])
+                if int(row['tag']) == 8:
+                    row['content'] = format_008(row['content'])
+            record.add_field(pymarc.Field(row['tag'], data=row['content']))
+        else:
+            subfields = []
+            for match in re.finditer('(?:\$)([^\$])([^\$]+)', row['content']):
+                subfields.append(match.group(1))
+                subfields.append(match.group(2))
+            record.add_field(pymarc.Field(row['tag'], row['indicators'], subfields))
     return record
 
-#Gets iterable of all the instance records.
+#Returns all the instance records.
 def get_instance_records_all(start = 0, limit = 10000, return_type = 'json'):
-    global okapi_url
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
-    url = okapi_url + '/instance-storage/instances'
+    url = config.config['data']['okapi_url'] + '/instance-storage/instances'
     a = start
     params = {'limit' : '1'}
     req = requests.get(url, params=params, headers=headers)
@@ -307,11 +365,12 @@ def get_instance_records_all(start = 0, limit = 10000, return_type = 'json'):
             print_status(a, end)
         start += 10000
 
-#Gets iterable of all the marc records.
-def get_marc_records_all(start = 333129, limit = 10000, return_type = 'marc'):
-    global okapi_url
+#Returns all the marc records.
+def get_marc_records_all(start = 1838462, limit = 10000, return_type = 'marc', number_of_processer = 40):
+    conn, cur = setup_database(initialize = True)
+    proc = processer(number_of_processer)
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
-    url = okapi_url + '/instance-storage/instances'
+    url = config.config['data']['okapi_url'] + '/instance-storage/instances'
     a = start
     params = {'limit' : '1'}
     req = requests.get(url, params=params, headers=headers)
@@ -323,27 +382,34 @@ def get_marc_records_all(start = 333129, limit = 10000, return_type = 'marc'):
         json_record = req.json()
         for instance_record in json_record['instances']:
             if return_type == 'text':
-                yield req.text
+                insert_into_table = (str(action_id), str(req.text))
+                cur.execute('INSERT INTO folio_action VALUES (?,?)', insert_into_table)
             elif return_type == 'json':
-                yield req.json()
+                insert_into_table = (str(action_id), str(json_record))
+                cur.execute('INSERT INTO folio_action VALUES (?,?)', insert_into_table)
             else:
-                marc_record = get_marc(uuid = instance_record['id'])
-                yield marc_record
+                marc_record = proc.process(threading.Thread, {'target' : get_marc_thread, 'kwargs' : {'action_id' : a, 'uuid' : instance_record['id']}})
             a += 1
             print_status(a, end)
+        proc.wait()
+        conn.commit()
         start += limit
+    proc.wait()
+    for search in cur.execute('SELECT record FROM folio_action ORDER BY action_id'):
+        yield next(text_marc_reader.get_marc_worldcat(search[0]))
+    conn.close()
+    os.remove('folio_action.db')
 
 #Gets instance_record.
 def get_instance_record(uuid = None, return_type = 'json'):
-    global okapi_url
     if uuid is None:
         uuid = get_uuid_from_user()
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
     if uuid != '' and uuid is not None:
-        url = okapi_url + '/instance-storage/instances/' + uuid
+        url = config.config['data']['okapi_url'] + '/instance-storage/instances/' + uuid
         req = requests.get(url, headers=headers)
     else:
-        url = okapi_url + '/instance-storage/instances?limit=0'
+        url = config.config['data']['okapi_url'] + '/instance-storage/instances?limit=0'
         req = requests.get(url, headers=headers)
     if return_type == 'text':
         return req.text
@@ -354,15 +420,14 @@ def get_instance_record(uuid = None, return_type = 'json'):
 
 #Gets holding records from instance_id.
 def get_holding_records_from_instance_id(uuid = None, return_type = 'json'):
-    global okapi_url
     if uuid is None:
         uuid = get_uuid_from_user()
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
     if uuid != '' and uuid is not None:
-        url = okapi_url + '/holdings-storage/holdings?limit=10000&query=instanceId==' + uuid
+        url = config.config['data']['okapi_url'] + '/holdings-storage/holdings?limit=10000&query=instanceId==' + uuid
         req = requests.get(url, headers=headers)
     else:
-        url = okapi_url + '/instance-storage/instances?limit=0'
+        url = config.config['data']['okapi_url'] + '/instance-storage/instances?limit=0'
         req = requests.get(url, headers=headers)
     if return_type == 'text':
         return req.text
@@ -373,15 +438,14 @@ def get_holding_records_from_instance_id(uuid = None, return_type = 'json'):
 
 #Gets item records from instance_id.
 def get_item_records_from_instance_id(uuid = None, return_type = 'json'):
-    global okapi_url
     if uuid is None:
         uuid = get_uuid_from_user()
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
     if uuid != '' and uuid is not None:
-        url = okapi_url + '/inventory/items?limit=10000&query=instance.id==' + uuid
+        url = config.config['data']['okapi_url'] + '/inventory/items?limit=10000&query=instance.id==' + uuid
         req = requests.get(url, headers=headers)
     else:
-        url = okapi_url + '/instance-storage/instances?limit=0'
+        url = config.config['data']['okapi_url'] + '/instance-storage/instances?limit=0'
         req = requests.get(url, headers=headers)
     if return_type == 'text':
         return req.text
@@ -391,18 +455,16 @@ def get_item_records_from_instance_id(uuid = None, return_type = 'json'):
 
 #Gets holding records.
 def get_holdings_record(uuid = None, return_type = 'json'):
-    global okapi_url
     if uuid is None:
         uuid = get_uuid_from_user()
     while re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid):
         uuid = re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid).group(1) + re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid).group(2)
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
-    print(uuid)
     if uuid != '' and uuid is not None:
-        url = okapi_url + '/holdings-storage/holdings/' + uuid
+        url = config.config['data']['okapi_url'] + '/holdings-storage/holdings/' + uuid
         req = requests.get(url, headers=headers)
     else:
-        url = okapi_url + '/holdings-storage/holdings?limit=0'
+        url = config.config['data']['okapi_url'] + '/holdings-storage/holdings?limit=0'
         params = {'limit': '0'}
         req = requests.get(url, params=params, headers=headers)
     if return_type == 'text':
@@ -413,26 +475,25 @@ def get_holdings_record(uuid = None, return_type = 'json'):
 
 #Suppresses record.
 def suppress_record(uuid = None):
-    global okapi_url
     if uuid is None:
         uuid = get_uuid_from_user()
     while re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid):
         uuid = re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid).group(1) + re.match('(.*)(?:[^a-f0-9\-]+)(.*$)', uuid).group(2)
     headers = {'Content-type' : 'application/json', 'Accept' : 'text/plain', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
     if uuid != '' and uuid is not None:
-        url = okapi_url + '/instance-storage/instances/' + uuid
+        url = config.config['data']['okapi_url'] + '/instance-storage/instances/' + uuid
         req = requests.get(url, headers=headers)
         json_record = req.json()
         json_record['discoverySuppress'] = True
         data = json.dumps(json_record)
+        response = requests.put(url, headers=headers, data=data)
         print(uuid + ' suppressed')
 
 
-#Gets iterable ofall the holding record ids.
+#Gets all the holding record ids.
 def get_holdings_record_ids(start = 0, limit = 100000, return_type = 'json'):
-    global okapi_url
     headers = {'Accept' : 'application/json', 'X-Okapi-Tenant' : config.config['data']['tenant'], 'x-okapi-token' : config.config['data']['okapi_token']}
-    url = okapi_url + '/holdings-storage/holdings'
+    url = config.config['data']['okapi_url'] + '/holdings-storage/holdings'
     a = start
     params = {'limit' : '1'}
     req = requests.get(url, params=params, headers=headers)
@@ -447,23 +508,4 @@ def get_holdings_record_ids(start = 0, limit = 100000, return_type = 'json'):
             a += 1
             print_status(a, end)
         start += limit
-
-
-if __name__=="__main__":
-    file_direct = os.path.dirname(os.path.realpath('__file__'))
-#    auth(change_okapi_url=True)
-#    auth(change_username=True, change_tenant=True, change_okapi_url=True, change_password=True)
-#    auth(refresh_token=True)
-#    get_marc()
-#    get_holdings_record()
-#    get_holdings_record_ids()
-#    for record in get_holdings_record_ids():
-#        pass
-#    get_instance_records_all()
-#    for record in get_instance_records_all():
-#        pass
-#    suppress_record()
-#    get_marc_records_all()
-    for record in get_marc_records_all():
-        pass
 
